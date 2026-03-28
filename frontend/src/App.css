@@ -9,21 +9,6 @@
     }
 }
 
-.App-header {
-    background-color: #0f0f10;
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    font-size: calc(10px + 2vmin);
-    color: white;
-}
-
-.App-link {
-    color: #61dafb;
-}
-
 @keyframes App-logo-spin {
     from {
         transform: rotate(0deg);
@@ -31,4 +16,26 @@
     to {
         transform: rotate(360deg);
     }
+}
+
+/* Ensure proper scrolling */
+html, body, #root {
+    min-height: 100%;
+}
+
+/* Remove default button outline */
+button:focus-visible {
+    outline: 2px solid #2E7D32;
+    outline-offset: 2px;
+}
+
+/* Smooth scrolling */
+html {
+    scroll-behavior: smooth;
+}
+
+/* Custom selection color */
+::selection {
+    background-color: #E8F5E9;
+    color: #1B5E20;
 }
