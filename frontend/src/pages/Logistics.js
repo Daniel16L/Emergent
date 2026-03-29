@@ -1,5 +1,6 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
+import { GoogleMap, useJsApiLoader, Marker, InfoWindow } from '@react-google-maps/api';
 import { 
   Truck, 
   MapPin,
@@ -38,6 +39,7 @@ import {
 import { toast } from 'sonner';
 
 const API_URL = process.env.REACT_APP_BACKEND_URL;
+const GOOGLE_MAPS_API_KEY = process.env.REACT_APP_GOOGLE_MAPS_API_KEY;
 
 const STATUS_COLORS = {
   pending: 'bg-yellow-100 text-yellow-800',
@@ -53,6 +55,61 @@ const STATUS_LABELS = {
   failed: 'Eșuat'
 };
 
+// Marker colors based on delivery status
+const MARKER_COLORS = {
+  pending: '#EAB308',    // Yellow
+  in_transit: '#3B82F6', // Blue
+  delivered: '#22C55E',  // Green
+  failed: '#EF4444'      // Red
+};
+
+// Suceava county center and surrounding coordinates
+const SUCEAVA_CENTER = { lat: 47.6514, lng: 25.9231 };
+
+// Sample coordinates for demo clients in Suceava county
+const CITY_COORDINATES = {
+  'Suceava': { lat: 47.6514, lng: 26.2556 },
+  'Rădăuți': { lat: 47.8489, lng: 25.9208 },
+  'Vatra Dornei': { lat: 47.3464, lng: 25.3544 },
+  'Fălticeni': { lat: 47.4597, lng: 26.3044 },
+  'Câmpulung Moldovenesc': { lat: 47.5314, lng: 25.5514 },
+  'Gura Humorului': { lat: 47.5539, lng: 25.8892 },
+  'Siret': { lat: 47.9500, lng: 26.0667 }
+};
+
+const mapContainerStyle = {
+  width: '100%',
+  height: '100%'
+};
+
+const mapOptions = {
+  disableDefaultUI: false,
+  zoomControl: true,
+  mapTypeControl: false,
+  streetViewControl: false,
+  fullscreenControl: true,
+  styles: [
+    {
+      featureType: 'poi',
+      elementType: 'labels',
+      stylers: [{ visibility: 'off' }]
+    }
+  ]
+};
+
+// Custom marker icon SVG generator
+const createMarkerIcon = (color) => {
+  return {
+    path: 'M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7zm0 9.5c-1.38 0-2.5-1.12-2.5-2.5s1.12-2.5 2.5-2.5 2.5 1.12 2.5 2.5-1.12 2.5-2.5 2.5z',
+    fillColor: color,
+    fillOpacity: 1,
+    strokeWeight: 2,
+    strokeColor: '#FFFFFF',
+    scale: 1.8,
+    anchor: { x: 12, y: 24 }
+  };
+};
+
 export default function Logistics() {
   const [orders, setOrders] = useState([]);
   const [deliveries, setDeliveries] = useState([]);
@@ -61,6 +118,8 @@ export default function Logistics() {
   const [loading, setLoading] = useState(true);
   const [showAssignDialog, setShowAssignDialog] = useState(false);
   const [selectedOrder, setSelectedOrder] = useState(null);
+  const [selectedMarker, setSelectedMarker] = useState(null);
+  const [map, setMap] = useState(null);
   const [assignForm, setAssignForm] = useState({
     driver_id: '',
     vehicle_id: '',
@@ -68,6 +127,19 @@ export default function Logistics() {
     km: '',
     transport_cost: ''
   });
+
+  const { isLoaded } = useJsApiLoader({
+    id: 'google-map-script',
+    googleMapsApiKey: GOOGLE_MAPS_API_KEY
+  });
+
+  const onLoad = useCallback((map) => {
+    setMap(map);
+  }, []);
+
+  const onUnmount = useCallback(() => {
+    setMap(null);
+  }, []);
 
   useEffect(() => {
     fetchData();
@@ -132,8 +204,7 @@ export default function Logistics() {
       d.vehicle_id === vehicleId && 
       ['pending', 'in_transit'].includes(d.status)
     );
-    // Simplified - in real app would calculate from order weights
-    return vehicleDeliveries.length * 2000; // Assume 2 tons average per delivery
+    return vehicleDeliveries.length * 2000;
   };
 
   const formatCurrency = (value) => {
@@ -143,6 +214,28 @@ export default function Logistics() {
       minimumFractionDigits: 0
     }).format(value);
   };
+
+  // Get coordinates for a delivery based on city in address
+  const getDeliveryCoordinates = (delivery, index) => {
+    const address = delivery.order_info?.client_address || '';
+    for (const [city, coords] of Object.entries(CITY_COORDINATES)) {
+      if (address.includes(city)) {
+        // Add small offset to prevent overlapping markers
+        return {
+          lat: coords.lat + (index * 0.008),
+          lng: coords.lng + (index * 0.008)
+        };
+      }
+    }
+    // Default to Suceava with offset
+    return {
+      lat: SUCEAVA_CENTER.lat + (index * 0.01),
+      lng: SUCEAVA_CENTER.lng + (index * 0.01)
+    };
+  };
+
+  // Get active deliveries for map display
+  const activeDeliveries = deliveries.filter(d => ['pending', 'in_transit'].includes(d.status));
 
   return (
     <div className="space-y-6" data-testid="logistics-page">
@@ -276,14 +369,15 @@ export default function Logistics() {
                   <CardHeader className="pb-2">
                     <CardTitle className="text-lg flex items-center gap-2">
                       <Calendar className="w-5 h-5" />
-                      Livrări Azi
+                      Livrări Active
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-2">
-                    {deliveries.filter(d => ['pending', 'in_transit'].includes(d.status)).slice(0, 5).map((delivery) => (
+                    {activeDeliveries.slice(0, 5).map((delivery) => (
                       <div 
                         key={delivery.id}
-                        className="p-2 bg-neutral-50 rounded-lg flex items-center justify-between"
+                        className="p-2 bg-neutral-50 rounded-lg flex items-center justify-between cursor-pointer hover:bg-neutral-100"
+                        onClick={() => setSelectedMarker(delivery)}
                       >
                         <div>
                           <p className="text-sm font-medium">{delivery.order_info?.client_name}</p>
@@ -294,34 +388,119 @@ export default function Logistics() {
                         </Badge>
                       </div>
                     ))}
-                    {deliveries.filter(d => ['pending', 'in_transit'].includes(d.status)).length === 0 && (
+                    {activeDeliveries.length === 0 && (
                       <p className="text-neutral-500 text-center py-4 text-sm">
-                        Nu există livrări programate
+                        Nu există livrări active
                       </p>
                     )}
+                  </CardContent>
+                </Card>
+
+                {/* Map Legend */}
+                <Card>
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm">Legendă Hartă</CardTitle>
+                  </CardHeader>
+                  <CardContent className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 rounded-full bg-yellow-500" />
+                      <span className="text-xs">În Așteptare</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 rounded-full bg-blue-500" />
+                      <span className="text-xs">În Tranzit</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 rounded-full bg-green-500" />
+                      <span className="text-xs">Livrat</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="w-4 h-4 rounded-full bg-red-500" />
+                      <span className="text-xs">Eșuat</span>
+                    </div>
                   </CardContent>
                 </Card>
               </div>
 
               {/* Map Column */}
               <div className="lg:col-span-6">
-                <Card className="h-full min-h-[500px]">
+                <Card className="h-full min-h-[600px]">
                   <CardHeader className="pb-2">
                     <CardTitle className="text-lg flex items-center gap-2">
                       <Navigation className="w-5 h-5" />
-                      Hartă Livrări
+                      Hartă Livrări - Județul Suceava
+                      <Badge variant="outline" className="ml-auto">
+                        {activeDeliveries.length} active
+                      </Badge>
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="p-0 h-[calc(100%-60px)]">
-                    <div className="w-full h-full bg-neutral-100 rounded-b-lg overflow-hidden">
-                      <iframe
-                        src="https://www.openstreetmap.org/export/embed.html?bbox=25.7%2C47.3%2C26.5%2C47.8&amp;layer=mapnik&amp;marker=47.6514,25.9231"
-                        width="100%"
-                        height="100%"
-                        style={{ border: 0 }}
-                        title="Hartă Livrări"
-                        data-testid="delivery-map"
-                      />
+                    <div className="w-full h-full rounded-b-lg overflow-hidden">
+                      {isLoaded ? (
+                        <GoogleMap
+                          mapContainerStyle={mapContainerStyle}
+                          center={SUCEAVA_CENTER}
+                          zoom={9}
+                          onLoad={onLoad}
+                          onUnmount={onUnmount}
+                          options={mapOptions}
+                        >
+                          {/* Delivery Markers */}
+                          {deliveries.map((delivery, index) => {
+                            const position = getDeliveryCoordinates(delivery, index);
+                            const markerColor = MARKER_COLORS[delivery.status] || MARKER_COLORS.pending;
+                            
+                            return (
+                              <Marker
+                                key={delivery.id}
+                                position={position}
+                                icon={createMarkerIcon(markerColor)}
+                                onClick={() => setSelectedMarker(delivery)}
+                                title={delivery.order_info?.client_name}
+                              />
+                            );
+                          })}
+
+                          {/* Info Window for selected marker */}
+                          {selectedMarker && (
+                            <InfoWindow
+                              position={getDeliveryCoordinates(selectedMarker, deliveries.indexOf(selectedMarker))}
+                              onCloseClick={() => setSelectedMarker(null)}
+                            >
+                              <div className="p-2 max-w-xs">
+                                <h3 className="font-semibold text-sm mb-1">
+                                  {selectedMarker.order_info?.client_name}
+                                </h3>
+                                <p className="text-xs text-gray-600 mb-2">
+                                  {selectedMarker.order_info?.client_address}
+                                </p>
+                                <div className="flex items-center justify-between">
+                                  <span className="text-xs font-medium text-green-700">
+                                    {formatCurrency(selectedMarker.order_info?.total || 0)}
+                                  </span>
+                                  <span className={`text-xs px-2 py-0.5 rounded ${
+                                    selectedMarker.status === 'pending' ? 'bg-yellow-100 text-yellow-800' :
+                                    selectedMarker.status === 'in_transit' ? 'bg-blue-100 text-blue-800' :
+                                    selectedMarker.status === 'delivered' ? 'bg-green-100 text-green-800' :
+                                    'bg-red-100 text-red-800'
+                                  }`}>
+                                    {STATUS_LABELS[selectedMarker.status]}
+                                  </span>
+                                </div>
+                                {selectedMarker.driver_info && (
+                                  <p className="text-xs text-gray-500 mt-2">
+                                    Șofer: {selectedMarker.driver_info.name}
+                                  </p>
+                                )}
+                              </div>
+                            </InfoWindow>
+                          )}
+                        </GoogleMap>
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center bg-neutral-100">
+                          <RefreshCw className="w-8 h-8 animate-spin text-[#2E7D32]" />
+                        </div>
+                      )}
                     </div>
                   </CardContent>
                 </Card>
