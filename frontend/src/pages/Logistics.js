@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import axios from 'axios';
 import { GoogleMap, useJsApiLoader, Marker, InfoWindow } from '@react-google-maps/api';
 import { 
@@ -63,19 +63,8 @@ const MARKER_COLORS = {
   failed: '#EF4444'      // Red
 };
 
-// Suceava county center and surrounding coordinates
+// Suceava county center
 const SUCEAVA_CENTER = { lat: 47.6514, lng: 25.9231 };
-
-// Sample coordinates for demo clients in Suceava county
-const CITY_COORDINATES = {
-  'Suceava': { lat: 47.6514, lng: 26.2556 },
-  'Rădăuți': { lat: 47.8489, lng: 25.9208 },
-  'Vatra Dornei': { lat: 47.3464, lng: 25.3544 },
-  'Fălticeni': { lat: 47.4597, lng: 26.3044 },
-  'Câmpulung Moldovenesc': { lat: 47.5314, lng: 25.5514 },
-  'Gura Humorului': { lat: 47.5539, lng: 25.8892 },
-  'Siret': { lat: 47.9500, lng: 26.0667 }
-};
 
 const mapContainerStyle = {
   width: '100%',
@@ -120,6 +109,9 @@ export default function Logistics() {
   const [selectedOrder, setSelectedOrder] = useState(null);
   const [selectedMarker, setSelectedMarker] = useState(null);
   const [map, setMap] = useState(null);
+  const [deliveryCoordinates, setDeliveryCoordinates] = useState({});
+  const [geocodingInProgress, setGeocodingInProgress] = useState(false);
+  const geocodedRef = useRef(new Set());
   const [assignForm, setAssignForm] = useState({
     driver_id: '',
     vehicle_id: '',
@@ -141,9 +133,78 @@ export default function Logistics() {
     setMap(null);
   }, []);
 
+  // Geocode a single address
+  const geocodeAddress = async (address) => {
+    if (!address || geocodedRef.current.has(address)) return null;
+    
+    try {
+      const response = await axios.post(`${API_URL}/api/geocode`, { address });
+      geocodedRef.current.add(address);
+      return response.data;
+    } catch (error) {
+      console.error('Geocoding error:', error);
+      geocodedRef.current.add(address); // Mark as attempted
+      return null;
+    }
+  };
+
+  // Geocode all deliveries
+  const geocodeDeliveries = async (deliveriesList) => {
+    if (geocodingInProgress) return;
+    setGeocodingInProgress(true);
+    
+    const newCoordinates = { ...deliveryCoordinates };
+    let hasUpdates = false;
+    
+    for (const delivery of deliveriesList) {
+      const address = delivery.order_info?.client_address;
+      if (!address) continue;
+      
+      // Skip if already have coordinates
+      if (delivery.coordinates) {
+        newCoordinates[delivery.id] = delivery.coordinates;
+        continue;
+      }
+      
+      // Skip if already geocoded in this session
+      if (newCoordinates[delivery.id]) continue;
+      
+      const coords = await geocodeAddress(address);
+      if (coords) {
+        newCoordinates[delivery.id] = { lat: coords.lat, lng: coords.lng };
+        hasUpdates = true;
+        
+        // Save coordinates to database
+        try {
+          await axios.patch(`${API_URL}/api/deliveries/${delivery.id}/coordinates`, {
+            lat: coords.lat,
+            lng: coords.lng
+          });
+        } catch (e) {
+          console.error('Error saving coordinates:', e);
+        }
+        
+        // Small delay to respect Nominatim rate limit (1 request per second)
+        await new Promise(resolve => setTimeout(resolve, 1100));
+      }
+    }
+    
+    if (hasUpdates) {
+      setDeliveryCoordinates(newCoordinates);
+    }
+    setGeocodingInProgress(false);
+  };
+
   useEffect(() => {
     fetchData();
   }, []);
+
+  // Geocode when deliveries change
+  useEffect(() => {
+    if (deliveries.length > 0) {
+      geocodeDeliveries(deliveries);
+    }
+  }, [deliveries]);
 
   const fetchData = async () => {
     setLoading(true);
@@ -158,6 +219,15 @@ export default function Logistics() {
       setDeliveries(deliveriesRes.data);
       setVehicles(vehiclesRes.data);
       setDrivers(driversRes.data);
+      
+      // Load existing coordinates
+      const coords = {};
+      deliveriesRes.data.forEach(d => {
+        if (d.coordinates) {
+          coords[d.id] = d.coordinates;
+        }
+      });
+      setDeliveryCoordinates(coords);
     } catch (error) {
       console.error('Error fetching data:', error);
     } finally {
@@ -170,7 +240,16 @@ export default function Logistics() {
     if (!selectedOrder) return;
 
     try {
-      await axios.post(`${API_URL}/api/deliveries`, {
+      // First geocode the address
+      let coordinates = null;
+      if (selectedOrder.client_address) {
+        const geocodeResult = await geocodeAddress(selectedOrder.client_address);
+        if (geocodeResult) {
+          coordinates = { lat: geocodeResult.lat, lng: geocodeResult.lng };
+        }
+      }
+
+      const response = await axios.post(`${API_URL}/api/deliveries`, {
         order_id: selectedOrder.id,
         delivery_type: 'own_fleet',
         driver_id: assignForm.driver_id,
@@ -179,6 +258,16 @@ export default function Logistics() {
         km: parseFloat(assignForm.km) || 0,
         transport_cost: parseFloat(assignForm.transport_cost) || 0
       });
+
+      // Save coordinates if we have them
+      if (coordinates && response.data.id) {
+        await axios.patch(`${API_URL}/api/deliveries/${response.data.id}/coordinates`, coordinates);
+        setDeliveryCoordinates(prev => ({
+          ...prev,
+          [response.data.id]: coordinates
+        }));
+      }
+
       toast.success('Livrare alocată cu succes!');
       setShowAssignDialog(false);
       setSelectedOrder(null);
@@ -215,27 +304,53 @@ export default function Logistics() {
     }).format(value);
   };
 
-  // Get coordinates for a delivery based on city in address
-  const getDeliveryCoordinates = (delivery, index) => {
-    const address = delivery.order_info?.client_address || '';
-    for (const [city, coords] of Object.entries(CITY_COORDINATES)) {
-      if (address.includes(city)) {
-        // Add small offset to prevent overlapping markers
-        return {
-          lat: coords.lat + (index * 0.008),
-          lng: coords.lng + (index * 0.008)
-        };
-      }
+  // Get coordinates for a delivery
+  const getDeliveryPosition = (delivery) => {
+    // First check saved coordinates
+    if (deliveryCoordinates[delivery.id]) {
+      return deliveryCoordinates[delivery.id];
     }
-    // Default to Suceava with offset
-    return {
-      lat: SUCEAVA_CENTER.lat + (index * 0.01),
-      lng: SUCEAVA_CENTER.lng + (index * 0.01)
-    };
+    // Check if delivery has coordinates field
+    if (delivery.coordinates) {
+      return delivery.coordinates;
+    }
+    // Fallback to center (will be geocoded)
+    return null;
   };
 
-  // Get active deliveries for map display
+  // Get active deliveries with coordinates for map display
+  const deliveriesWithCoords = deliveries.filter(d => {
+    const pos = getDeliveryPosition(d);
+    return pos !== null;
+  });
+
   const activeDeliveries = deliveries.filter(d => ['pending', 'in_transit'].includes(d.status));
+
+  // Fit bounds to show all markers
+  useEffect(() => {
+    if (map && deliveriesWithCoords.length > 0) {
+      const bounds = new window.google.maps.LatLngBounds();
+      let hasValidBounds = false;
+      
+      deliveriesWithCoords.forEach(delivery => {
+        const pos = getDeliveryPosition(delivery);
+        if (pos) {
+          bounds.extend(pos);
+          hasValidBounds = true;
+        }
+      });
+      
+      if (hasValidBounds) {
+        map.fitBounds(bounds, { padding: 50 });
+        // Don't zoom in too much
+        const listener = window.google.maps.event.addListenerOnce(map, 'idle', () => {
+          if (map.getZoom() > 14) {
+            map.setZoom(14);
+          }
+        });
+      }
+    }
+  }, [map, deliveriesWithCoords.length, deliveryCoordinates]);
 
   return (
     <div className="space-y-6" data-testid="logistics-page">
@@ -245,10 +360,18 @@ export default function Logistics() {
           <h1 className="text-2xl md:text-3xl font-bold text-neutral-900">Logistică</h1>
           <p className="text-neutral-500 mt-1">Planificare și urmărire livrări</p>
         </div>
-        <Button variant="outline" onClick={fetchData} className="gap-2">
-          <RefreshCw className="w-4 h-4" />
-          Actualizare
-        </Button>
+        <div className="flex gap-2">
+          {geocodingInProgress && (
+            <Badge variant="outline" className="gap-1">
+              <RefreshCw className="w-3 h-3 animate-spin" />
+              Geocodare...
+            </Badge>
+          )}
+          <Button variant="outline" onClick={fetchData} className="gap-2">
+            <RefreshCw className="w-4 h-4" />
+            Actualizare
+          </Button>
+        </div>
       </div>
 
       <Tabs defaultValue="fleet" className="space-y-6">
@@ -373,21 +496,38 @@ export default function Logistics() {
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="space-y-2">
-                    {activeDeliveries.slice(0, 5).map((delivery) => (
-                      <div 
-                        key={delivery.id}
-                        className="p-2 bg-neutral-50 rounded-lg flex items-center justify-between cursor-pointer hover:bg-neutral-100"
-                        onClick={() => setSelectedMarker(delivery)}
-                      >
-                        <div>
-                          <p className="text-sm font-medium">{delivery.order_info?.client_name}</p>
-                          <p className="text-xs text-neutral-500">{delivery.driver_info?.name}</p>
+                    {activeDeliveries.slice(0, 5).map((delivery) => {
+                      const hasCoords = !!getDeliveryPosition(delivery);
+                      return (
+                        <div 
+                          key={delivery.id}
+                          className="p-2 bg-neutral-50 rounded-lg flex items-center justify-between cursor-pointer hover:bg-neutral-100"
+                          onClick={() => {
+                            if (hasCoords) {
+                              setSelectedMarker(delivery);
+                              const pos = getDeliveryPosition(delivery);
+                              if (map && pos) {
+                                map.panTo(pos);
+                                map.setZoom(14);
+                              }
+                            }
+                          }}
+                        >
+                          <div className="flex items-center gap-2">
+                            {!hasCoords && (
+                              <RefreshCw className="w-3 h-3 animate-spin text-neutral-400" />
+                            )}
+                            <div>
+                              <p className="text-sm font-medium">{delivery.order_info?.client_name}</p>
+                              <p className="text-xs text-neutral-500">{delivery.driver_info?.name}</p>
+                            </div>
+                          </div>
+                          <Badge className={STATUS_COLORS[delivery.status]}>
+                            {STATUS_LABELS[delivery.status]}
+                          </Badge>
                         </div>
-                        <Badge className={STATUS_COLORS[delivery.status]}>
-                          {STATUS_LABELS[delivery.status]}
-                        </Badge>
-                      </div>
-                    ))}
+                      );
+                    })}
                     {activeDeliveries.length === 0 && (
                       <p className="text-neutral-500 text-center py-4 text-sm">
                         Nu există livrări active
@@ -430,7 +570,7 @@ export default function Logistics() {
                       <Navigation className="w-5 h-5" />
                       Hartă Livrări - Județul Suceava
                       <Badge variant="outline" className="ml-auto">
-                        {activeDeliveries.length} active
+                        {deliveriesWithCoords.length} pe hartă
                       </Badge>
                     </CardTitle>
                   </CardHeader>
@@ -446,8 +586,10 @@ export default function Logistics() {
                           options={mapOptions}
                         >
                           {/* Delivery Markers */}
-                          {deliveries.map((delivery, index) => {
-                            const position = getDeliveryCoordinates(delivery, index);
+                          {deliveriesWithCoords.map((delivery) => {
+                            const position = getDeliveryPosition(delivery);
+                            if (!position) return null;
+                            
                             const markerColor = MARKER_COLORS[delivery.status] || MARKER_COLORS.pending;
                             
                             return (
@@ -462,9 +604,9 @@ export default function Logistics() {
                           })}
 
                           {/* Info Window for selected marker */}
-                          {selectedMarker && (
+                          {selectedMarker && getDeliveryPosition(selectedMarker) && (
                             <InfoWindow
-                              position={getDeliveryCoordinates(selectedMarker, deliveries.indexOf(selectedMarker))}
+                              position={getDeliveryPosition(selectedMarker)}
                               onCloseClick={() => setSelectedMarker(null)}
                             >
                               <div className="p-2 max-w-xs">

@@ -17,6 +17,10 @@ from datetime import datetime, timezone, timedelta
 import bcrypt
 import jwt
 import random
+import httpx
+
+# Nominatim geocoding cache to avoid repeated requests
+geocode_cache = {}
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -817,6 +821,103 @@ async def get_agents(request: Request):
     user = await get_current_user(request)
     agents = await db.users.find({"role": "agent"}, {"password_hash": 0}).to_list(100)
     return [{"id": str(a["_id"]), **{k: v for k, v in a.items() if k != "_id"}} for a in agents]
+
+# Geocoding function using Nominatim
+async def geocode_address(address: str) -> Optional[dict]:
+    """Geocode an address using Nominatim API"""
+    if not address:
+        return None
+    
+    # Check cache first
+    cache_key = address.lower().strip()
+    if cache_key in geocode_cache:
+        return geocode_cache[cache_key]
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            # Add Romania context for better results
+            search_query = f"{address}, Romania"
+            response = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={
+                    "q": search_query,
+                    "format": "json",
+                    "limit": 1,
+                    "countrycodes": "ro"
+                },
+                headers={
+                    "User-Agent": "TomibenaCRM/1.0 (contact@tomibena.ro)"
+                },
+                timeout=10.0
+            )
+            
+            if response.status_code == 200:
+                results = response.json()
+                if results and len(results) > 0:
+                    coords = {
+                        "lat": float(results[0]["lat"]),
+                        "lng": float(results[0]["lon"]),
+                        "display_name": results[0].get("display_name", address)
+                    }
+                    geocode_cache[cache_key] = coords
+                    return coords
+    except Exception as e:
+        logger.error(f"Geocoding error for '{address}': {e}")
+    
+    return None
+
+# Geocode endpoint
+@api_router.post("/geocode")
+async def geocode_endpoint(request: Request):
+    await get_current_user(request)
+    body = await request.json()
+    address = body.get("address", "")
+    
+    if not address:
+        raise HTTPException(status_code=400, detail="Address required")
+    
+    coords = await geocode_address(address)
+    if coords:
+        return coords
+    else:
+        raise HTTPException(status_code=404, detail="Address not found")
+
+# Batch geocode for multiple addresses
+@api_router.post("/geocode/batch")
+async def batch_geocode(request: Request):
+    await get_current_user(request)
+    body = await request.json()
+    addresses = body.get("addresses", [])
+    
+    results = {}
+    for addr in addresses:
+        if addr:
+            coords = await geocode_address(addr)
+            if coords:
+                results[addr] = coords
+    
+    return results
+
+# Update delivery coordinates
+@api_router.patch("/deliveries/{delivery_id}/coordinates")
+async def update_delivery_coordinates(delivery_id: str, request: Request):
+    await get_current_user(request)
+    body = await request.json()
+    lat = body.get("lat")
+    lng = body.get("lng")
+    
+    if lat is None or lng is None:
+        raise HTTPException(status_code=400, detail="lat and lng required")
+    
+    result = await db.deliveries.update_one(
+        {"_id": ObjectId(delivery_id)},
+        {"$set": {"coordinates": {"lat": lat, "lng": lng}}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Delivery not found")
+    
+    return {"message": "Coordinates updated"}
 
 # Include the router in the main app
 app.include_router(api_router)
